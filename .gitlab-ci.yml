@@ -1,0 +1,212 @@
+# GitLab CI/CD Pipeline Configuration
+stages:
+  - build
+  - deploy
+
+variables:
+  DOCKER_IMAGE: "10.200.99.202:15080/zero2x002/zero2x_repository:${CI_COMMIT_SHORT_SHA}-${CI_PIPELINE_ID}"
+  KUBECONFIG: "/tmp/kubeconfig"
+
+  CONTEST_ID: 1
+
+  # Dataset settings, path is the mount path inside the container, you can modify it; use this absolute path in your code
+  DATASETS: '[{"name":"itu赛道一推理数据集","uuid":"b5a79106-9183-4e49-beca-a3277470ded3","path":"/input","version":"V1"}]'
+  # Model output settings, do not modify the path, outputPath is the output path inside the container, you can modify it; this value must match OUTPUT_DIR in ENV_VARS
+  OUTPUT_DIR: '{"uuid":"f57d771e-ea0c-40a0-a161-d7b150695df6","bucket":"default","path":"output/track1/$GITLAB_USER_EMAIL","outputPath":"/mnt/si000886fq1w/default/output","ossName":"si000886fq1w"}'
+  ENV_VARS: '[{"key":"PYTHONUNBUFFERED","value":"1"},{"key":"OUTPUT_DIR","value":"/mnt/si000886fq1w/default/output"}]'
+
+  # 请注意我们对模型的输出名称有要求具体请查询README文档
+  # Please note that we have specific requirements for the model's output name. Kindly refer to the README document for details.
+  # Startup command, you can modify it to your own startup command
+  START_CMD: "python train.py"
+
+  # Algorithm parameters, name and description can be modified
+  ALGO_NAME: "track1"
+  ALGO_TYPE: "train"
+  SRC_TYPE: "image"
+  ALGO_DESCRIPTION: "track1"
+
+  # Training job parameters
+  JOB_NAME: "track1"
+  JOB_TYPE: "AI_TRAIN"
+  USER_ID: "1775119847203"
+  BIZ_TYPE: "DROS"
+
+  # Computing resource parameters
+  PROJECT_UUID: "pr-1233749118618099712"
+  SUBMISSION_NAME: "人工智能与太空计算挑战赛"
+  COMPUTE_SPEC_UUID: "036476ce-ff2d-40a7-b750-1c443dc89a41"
+  COMPUTE_SPEC_NAME: "Z2120-cuda12.8-80Gx1-8C100G"
+  WORKER_NUM: 1
+
+  # Other optional parameters
+  RUN_TYPE: ""
+  USE_TENSORBOARD: "false"
+  AUTO_RESTART: "false"
+  MAX_RESTARTS: 3
+  RESUMEABLE: "false"
+  ENABLE_SPOT_RESTART: "false"
+
+build-job:
+  stage: build
+  tags:
+    - k8s-itu-runner
+  cache:
+    key: "pip-${CI_PROJECT_ID}-${CI_COMMIT_REF_SLUG}"   # Independent cache per branch
+    paths:
+      - .pip-cache/                     # Cache this directory
+    policy: pull-push                   # Pull before build, push after build
+  before_script:
+    - echo "Waiting for Docker daemon to start..."
+    - echo "$CI_PROJECT_ID"
+    - echo "$CI_PIPELINE_ID"
+    - echo "$CI_JOB_ID"
+    - |
+      timeout=60
+      until docker info >/dev/null 2>&1; do
+        if [ $timeout -le 0 ]; then
+          echo "❌ Timeout: Docker daemon did not start"
+          nc -zv docker 2375 || echo "Port 2375 unreachable"
+          exit 1
+        fi
+        echo "Waiting... (${timeout}s remaining)"
+        sleep 2
+        timeout=$((timeout - 2))
+      done
+    - echo "✅ Docker daemon is ready"
+    - docker version
+    - docker info
+
+  image: swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/library/docker:latest
+  services:
+    - name: swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/library/docker:dind
+      alias: docker
+      command:
+        - "--tls=false"
+        - "--insecure-registry=cr-ee.registry.cn-hangzhou-zjy-d01.res.cloud.zhejianglab.com"
+        - "--insecure-registry=10.200.99.202:15080"
+
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: always
+  script:
+    - docker info
+    - echo $DOCKER_REPOSITORY_PWD | docker login 10.200.99.202:15080 -u $DOCKER_REPOSITORY_USERNAME --password-stdin
+
+    # Build the image, using the fixed cache tag as a cache source
+    - docker build -t $DOCKER_IMAGE .
+
+    # Push the new image
+    - docker push $DOCKER_IMAGE
+
+    - echo "Build completed, image pushed to ACR： $DOCKER_IMAGE"
+  after_script:
+    - echo "BUILD_JOB_ID=$CI_JOB_ID" > build_job_id.env
+  artifacts:
+    reports:
+      dotenv: build_job_id.env
+
+# ========== Stage 2: Obtain credentials and create algorithm ==========
+create-algorithm-and-job:
+  stage: deploy
+  tags:
+    - itudemo
+  image: alpine/curl:latest
+  dependencies:
+    - build-job
+  before_script:
+    - echo "Starting to create algorithm, training job and record data..."
+    - echo "✅ curl installed"
+    - |
+      # Check necessary authentication variables
+      if [ -z "$OAUTH2_CLIENT_SECRET" ]; then
+        echo "❌ Error: OAUTH2_CLIENT_SECRET variable is not set"
+        exit 1
+      fi
+  script:
+    - |
+      GITLAB_JOB_IDS="${BUILD_JOB_ID},${CI_JOB_ID}"
+      echo "GitLab Job IDs: $GITLAB_JOB_IDS"
+
+      # Get OAuth2 Client Token
+      echo "==============================="
+      echo "Step 1: Getting OAuth2 Client Token..."
+      echo "==============================="
+      
+      OAUTH2_RESPONSE=$(curl -s -X POST "$OAUTH2_SERVER_URL/oauth2/client_token" \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        --data-urlencode "grant_type=client_credentials" \
+        --data-urlencode "client_id=gitlab" \
+        --data-urlencode "client_secret=$OAUTH2_CLIENT_SECRET" \
+        --write-out "\n%{http_code}" \
+        --connect-timeout 30)
+
+      OAUTH2_HTTP_STATUS=$(echo "$OAUTH2_RESPONSE" | tail -n1)
+      OAUTH2_RESPONSE_BODY=$(echo "$OAUTH2_RESPONSE" | sed '$d')
+
+      echo "OAuth2 API HTTP status code: $OAUTH2_HTTP_STATUS"
+
+      if [ "$OAUTH2_HTTP_STATUS" -ge 200 ] && [ "$OAUTH2_HTTP_STATUS" -lt 300 ]; then
+        # Extract OAuth2 token
+        OAUTH2_TOKEN=$(echo "$OAUTH2_RESPONSE_BODY" | grep -o '"client_token":"[^"]*"' | head -1 | sed 's/"client_token":"//;s/"//g')
+
+        if [ -z "$OAUTH2_TOKEN" ] || [ "$OAUTH2_TOKEN" = "null" ]; then
+          echo "❌ Failed to obtain OAuth2 token: no client_token field in response"
+          echo "Response: $OAUTH2_RESPONSE_BODY"
+          exit 1
+        fi
+        echo "✅ OAuth2 Client Token obtained successfully"
+      else
+        echo "❌ Failed to obtain OAuth2 token, HTTP status code: $OAUTH2_HTTP_STATUS"
+        echo "Response: $OAUTH2_RESPONSE_BODY"
+        exit 1
+      fi
+
+      echo "==============================="
+      echo "Step 2: Calling Java service to create algorithm, job and record data..."
+      echo "==============================="
+      
+      # Manually build JSON request body (add email field and oauth2Token field)
+      CREATE_REQUEST_JSON="{\"contestId\":$CONTEST_ID,\"userId\":\"$USER_ID\",\"bizType\":\"$BIZ_TYPE\",\"algoName\":\"$ALGO_NAME\",\"algoType\":\"$ALGO_TYPE\",\"srcType\":\"$SRC_TYPE\",\"imageUrl\":\"$DOCKER_IMAGE\",\"algoDescription\":\"$ALGO_DESCRIPTION\",\"jobName\":\"$JOB_NAME\",\"jobType\":\"$JOB_TYPE\",\"projectUuid\":\"$PROJECT_UUID\",\"subMissionName\":\"$SUBMISSION_NAME\",\"computeSpecUuid\":\"$COMPUTE_SPEC_UUID\",\"computeSpecName\":\"$COMPUTE_SPEC_NAME\",\"workerNum\":$WORKER_NUM,\"dataSets\":$DATASETS,\"outputDir\":$OUTPUT_DIR,\"envVars\":$ENV_VARS,\"startCmd\":\"$START_CMD\",\"gitlabProjectId\":\"$CI_PROJECT_ID\",\"gitlabJobIds\":\"$GITLAB_JOB_IDS\",\"email\":\"$GITLAB_USER_EMAIL\",\"oauth2Token\":\"$OAUTH2_TOKEN\"}"
+      echo "📄 [DEBUG] Request JSON: $CREATE_REQUEST_JSON"
+
+      # Call the Java service (add OAuth2 Token in the request header)
+      CREATE_RESPONSE=$(curl -s -X POST \
+        "$OAUTH2_SERVER_URL/itu/createAlgorithmAndJob" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $OAUTH2_TOKEN" \
+        -d "$CREATE_REQUEST_JSON" \
+        --write-out "\n%{http_code}" \
+        --connect-timeout 60 \
+        --max-time 120)
+
+      HTTP_STATUS=$(echo "$CREATE_RESPONSE" | tail -n1)
+      RESPONSE_BODY=$(echo "$CREATE_RESPONSE" | sed '$d')
+
+      echo "📄 [DEBUG] Java service response: $RESPONSE_BODY"
+      echo "HTTP status code: $HTTP_STATUS"
+
+      if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+        echo "✅ Java service call successful"
+        ALGORITHM_UUID=$(echo "$RESPONSE_BODY" | grep -o '"algorithmUuid":"[^"]*"' | head -1 | sed 's/"algorithmUuid":"//;s/"//g')
+        JOB_UUID=$(echo "$RESPONSE_BODY" | grep -o '"jobUuid":"[^"]*"' | head -1 | sed 's/"jobUuid":"//;s/"//g')
+
+        if [ -z "$ALGORITHM_UUID" ] || [ -z "$JOB_UUID" ]; then
+          echo "❌ Failed to parse algorithmUuid or jobUuid from response"
+          exit 1
+        fi
+
+        echo "🎉 Algorithm and training job created successfully, data recorded!"
+        echo "📋 Algorithm UUID: $ALGORITHM_UUID"
+        echo "📋 Training job ID (Nanhu job ID): $JOB_UUID"
+      else
+        echo "❌ Java service call failed"
+        echo "Response: $RESPONSE_BODY"
+        exit 1
+      fi
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: on_success
