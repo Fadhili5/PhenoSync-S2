@@ -30,7 +30,7 @@ sudo vim /etc/docker/daemon.json
 systemctl daemon-reload
 systemctl restart docker
 
-docker login http://gitlab.zero2x.org:5050
+docker login http://gitlab-itu.zero2x.org:5050
 
 docker pull gitlab-itu.zero2x.org:5050/itu_images/itu_docker_images:ubuntu22.04-py310.19
 docker pull gitlab-itu.zero2x.org:5050/itu_images/itu_docker_images:ubuntu22.04-cuda12.3.2-cudnn9-py310.19
