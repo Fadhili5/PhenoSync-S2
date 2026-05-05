@@ -1,0 +1,5 @@
+point_id,Longitude,Latitude,phenophase_date,Pre_crop_type,Pre_phenophase
+6,124.969305,48.806703,2018/7/23,corn,Maturity
+7,124.914303,48.807416,2018/7/23,soybean,Maturity
+8,124.903949,48.802374,2018/7/23,soybean,Maturity
+9,124.807718,48.81456,2018/7/23,soybean,Maturity
