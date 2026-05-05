@@ -289,23 +289,6 @@ def main():
     features                  = extract_all_features(df, tiff_index, region_bounds)
     y_crop, y_pheno, le_crop, le_pheno = encode_labels(df)
 
-    # Drop out-of-bounds points (no matching TIFF region) — zero features corrupt training
-    mask = ~features["oob"]
-    n_dropped = features["oob"].sum()
-    if n_dropped:
-        print(f"[train] Dropping {n_dropped} out-of-bounds points, {mask.sum()} remain")
-    features = {
-        "flat"   : features["flat"][mask],
-        "seqs"   : [s for s, m in zip(features["seqs"], mask) if m],
-        "lengths": features["lengths"][mask],
-        "doys"   : features["doys"][mask],
-        "oob"    : features["oob"][mask],
-    }
-    y_crop  = y_crop[mask]
-    y_pheno = y_pheno[mask]
-
-    assert len(y_crop) > 0, "No in-bounds training samples — check label CSV coords vs TIFF regions"
-
     # Save label encoders (inference needs them)
     os.makedirs(args.output_dir, exist_ok=True)
     joblib.dump({"crop": le_crop, "pheno": le_pheno},
