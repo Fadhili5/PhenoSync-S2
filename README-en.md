@@ -36,3 +36,63 @@ docker pull gitlab-itu.zero2x.org:5050/itu_images/itu_docker_images:ubuntu22.04-
 docker pull gitlab-itu.zero2x.org:5050/itu_images/itu_docker_images:ubuntu22.04-cuda12.3.2-cudnn9-py310.19
 docker pull gitlab-itu.zero2x.org:5050/itu_images/itu_docker_images/competition-base:pytorch2.5.1-cuda12.1-cudnn9
 ```
+
+---
+
+## How to Run Locally (Track 1)
+
+### 1. Install Dependencies
+
+```bash
+pip install numpy pandas scikit-learn torch xgboost joblib rasterio
+```
+
+### 2. Train
+
+**XGBoost** (no GPU needed):
+```bash
+python train.py --mode xgboost \
+    --label_csv test_input_sample/test_data_label_sample.csv \
+    --tiff_dirs test_input_sample/region_test \
+    --output_dir models
+```
+
+**LSTM** (GPU recommended):
+```bash
+python train.py --mode lstm \
+    --label_csv test_input_sample/test_data_label_sample.csv \
+    --tiff_dirs test_input_sample/region_test \
+    --output_dir models \
+    --epochs 50 --batch_size 64 --hidden_dim 128
+```
+
+Trained model files are saved to `models/`.
+
+### 3. Run Inference
+
+```bash
+python inference.py \
+    --input_csv  test_input_sample/test_point.csv \
+    --tiff_dir   test_input_sample/region_test \
+    --output_dir output \
+    --model_dir  models
+```
+
+Output: `output/result.json`
+
+**With local scoring** (requires label CSV):
+```bash
+python inference.py \
+    --input_csv  test_input_sample/test_point.csv \
+    --tiff_dir   test_input_sample/region_test \
+    --output_dir output \
+    --model_dir  models \
+    --label_csv  test_input_sample/test_data_label_sample.csv
+```
+
+### Notes
+
+- On Windows, replace `\` with `` ` `` (PowerShell) or use `/` (Git Bash).
+- Without training first, inference runs but returns placeholder predictions only.
+- `DATA/*.zip` contains full training data — extract for better model performance.
+- `run.sh` uses Docker paths (`/workspace/`, `/input/`) and is intended for CI/container use only.
