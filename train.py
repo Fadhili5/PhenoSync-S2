@@ -77,20 +77,29 @@ def train_xgboost(X: np.ndarray, y_crop: np.ndarray, y_pheno: np.ndarray,
         n_jobs=-1, random_state=42,
     )
 
+    # XGBoost requires contiguous 0-indexed labels; remap and save for inference decoding
+    from sklearn.preprocessing import LabelEncoder as _LE
+    xgb_re_crop  = _LE().fit(y_crop)
+    xgb_re_pheno = _LE().fit(y_pheno)
+    y_crop_fit  = xgb_re_crop.transform(y_crop)
+    y_pheno_fit = xgb_re_pheno.transform(y_pheno)
+    joblib.dump({"crop": xgb_re_crop, "pheno": xgb_re_pheno},
+                os.path.join(output_dir, "xgb_remapper.pkl"))
+
     model_crop = XGBClassifier(**params)
-    model_crop.fit(X, y_crop)
+    model_crop.fit(X, y_crop_fit)
     joblib.dump(model_crop, os.path.join(output_dir, "xgb_crop.pkl"))
     print(f"[xgb] Crop model saved")
 
     print(f"[xgb] Training phenology classifier...")
     model_pheno = XGBClassifier(**params)
-    model_pheno.fit(X, y_pheno)
+    model_pheno.fit(X, y_pheno_fit)
     joblib.dump(model_pheno, os.path.join(output_dir, "xgb_pheno.pkl"))
     print(f"[xgb] Phenology model saved")
 
     # Quick train accuracy
-    train_acc_crop  = (model_crop.predict(X)  == y_crop).mean()
-    train_acc_pheno = (model_pheno.predict(X) == y_pheno).mean()
+    train_acc_crop  = (model_crop.predict(X)  == y_crop_fit).mean()
+    train_acc_pheno = (model_pheno.predict(X) == y_pheno_fit).mean()
     print(f"[xgb] Train acc — crop={train_acc_crop:.3f}, pheno={train_acc_pheno:.3f}")
 
 

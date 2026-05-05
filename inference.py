@@ -53,6 +53,9 @@ def load_models(model_dir: str) -> dict:
     if os.path.exists(xgb_crop) and os.path.exists(xgb_pheno):
         models["xgb_crop"]  = joblib.load(xgb_crop)
         models["xgb_pheno"] = joblib.load(xgb_pheno)
+        remap_path = os.path.join(model_dir, "xgb_remapper.pkl")
+        if os.path.exists(remap_path):
+            models["xgb_remapper"] = joblib.load(remap_path)
         print(f"[model] XGBoost models loaded")
         return models
 
@@ -105,11 +108,19 @@ def run_inference(features: dict, models: dict) -> tuple:
 
     # ── XGBoost ──
     if "xgb_crop" in models:
-        X = features["flat"]
-        c_idx = models["xgb_crop"].predict(X)
-        p_idx = models["xgb_pheno"].predict(X)
-        crop_preds  = [le_crop.inverse_transform([c])[0]  if le_crop  else CROP_CLASSES[c]  for c in c_idx]
-        pheno_preds = [le_pheno.inverse_transform([p])[0] if le_pheno else PHENO_CLASSES[p] for p in p_idx]
+        X       = features["flat"]
+        c_idx   = models["xgb_crop"].predict(X)
+        p_idx   = models["xgb_pheno"].predict(X)
+        remapper = models.get("xgb_remapper")
+        if remapper and le_crop and le_pheno:
+            # decode: xgb 0-indexed → original label-encoder indices → class names
+            c_orig = remapper["crop"].inverse_transform(c_idx)
+            p_orig = remapper["pheno"].inverse_transform(p_idx)
+            crop_preds  = le_crop.inverse_transform(c_orig).tolist()
+            pheno_preds = le_pheno.inverse_transform(p_orig).tolist()
+        else:
+            crop_preds  = [le_crop.inverse_transform([c])[0]  if le_crop  else CROP_CLASSES[c]  for c in c_idx]
+            pheno_preds = [le_pheno.inverse_transform([p])[0] if le_pheno else PHENO_CLASSES[p] for p in p_idx]
         return crop_preds, pheno_preds
 
     # ── Placeholder ──
