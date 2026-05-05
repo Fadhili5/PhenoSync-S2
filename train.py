@@ -37,8 +37,12 @@ from model import CropPhenologyLSTM, CROP_CLASSES, PHENO_CLASSES
 
 def load_labels(csv_path: str) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
-    # Training CSV uses crop_type / phenophase_name
-    assert "crop_type"      in df.columns, "Missing crop_type column"
+    # Normalize column names: accept Pre_crop_type / Pre_phenophase variants
+    if "Pre_crop_type" in df.columns and "crop_type" not in df.columns:
+        df = df.rename(columns={"Pre_crop_type": "crop_type"})
+    if "Pre_phenophase" in df.columns and "phenophase_name" not in df.columns:
+        df = df.rename(columns={"Pre_phenophase": "phenophase_name"})
+    assert "crop_type"       in df.columns, "Missing crop_type column"
     assert "phenophase_name" in df.columns, "Missing phenophase_name column"
     df = df.dropna(subset=["crop_type", "phenophase_name"])
     print(f"[labels] {len(df)} samples | crops={df.crop_type.unique().tolist()}")
