@@ -19,7 +19,9 @@ Usage:
 """
 
 import argparse
+import csv
 import os
+from datetime import datetime
 import numpy as np
 import pandas as pd
 import joblib
@@ -27,10 +29,23 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import LabelEncoder
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, train_test_split
 
 from features import build_tiff_index, extract_all_features
 from model import CropPhenologyLSTM, CROP_CLASSES, PHENO_CLASSES
+
+
+# ── TRAINING LOG ───────────────────────────────────────────────────────────────
+
+def append_log(output_dir: str, row: dict):
+    log_path = os.path.join(output_dir, "training_log.csv")
+    write_header = not os.path.exists(log_path)
+    with open(log_path, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=row.keys())
+        if write_header:
+            w.writeheader()
+        w.writerow(row)
+    print(f"[log] Run appended → {log_path}")
 
 
 # ── LABEL LOADING ──────────────────────────────────────────────────────────────
@@ -73,7 +88,7 @@ def train_xgboost(X: np.ndarray, y_crop: np.ndarray, y_pheno: np.ndarray,
     params = dict(
         n_estimators=500, max_depth=6, learning_rate=0.05,
         subsample=0.8, colsample_bytree=0.8,
-        use_label_encoder=False, eval_metric="mlogloss",
+        eval_metric="mlogloss",
         n_jobs=-1, random_state=42,
     )
 
@@ -86,21 +101,40 @@ def train_xgboost(X: np.ndarray, y_crop: np.ndarray, y_pheno: np.ndarray,
     joblib.dump({"crop": xgb_re_crop, "pheno": xgb_re_pheno},
                 os.path.join(output_dir, "xgb_remapper.pkl"))
 
+    crop_path  = os.path.join(output_dir, "xgb_crop.pkl")
+    pheno_path = os.path.join(output_dir, "xgb_pheno.pkl")
+
     model_crop = XGBClassifier(**params)
-    model_crop.fit(X, y_crop_fit)
-    joblib.dump(model_crop, os.path.join(output_dir, "xgb_crop.pkl"))
+    prev_booster_crop = joblib.load(crop_path).get_booster() if os.path.exists(crop_path) else None
+    if prev_booster_crop:
+        print(f"[xgb] Warm-starting crop model from previous booster")
+    model_crop.fit(X, y_crop_fit, xgb_model=prev_booster_crop)
+    joblib.dump(model_crop, crop_path)
     print(f"[xgb] Crop model saved")
 
     print(f"[xgb] Training phenology classifier...")
     model_pheno = XGBClassifier(**params)
-    model_pheno.fit(X, y_pheno_fit)
-    joblib.dump(model_pheno, os.path.join(output_dir, "xgb_pheno.pkl"))
+    prev_booster_pheno = joblib.load(pheno_path).get_booster() if os.path.exists(pheno_path) else None
+    if prev_booster_pheno:
+        print(f"[xgb] Warm-starting pheno model from previous booster")
+    model_pheno.fit(X, y_pheno_fit, xgb_model=prev_booster_pheno)
+    joblib.dump(model_pheno, pheno_path)
     print(f"[xgb] Phenology model saved")
 
-    # Quick train accuracy
     train_acc_crop  = (model_crop.predict(X)  == y_crop_fit).mean()
     train_acc_pheno = (model_pheno.predict(X) == y_pheno_fit).mean()
     print(f"[xgb] Train acc — crop={train_acc_crop:.3f}, pheno={train_acc_pheno:.3f}")
+
+    append_log(output_dir, {
+        "timestamp"       : datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "mode"            : "xgboost",
+        "n_samples"       : len(X),
+        "train_acc_crop"  : round(float(train_acc_crop),  4),
+        "train_acc_pheno" : round(float(train_acc_pheno), 4),
+        "val_acc_crop"    : "",
+        "val_acc_pheno"   : "",
+        "best_loss"       : "",
+    })
 
 
 # ── LSTM DATASET ───────────────────────────────────────────────────────────────
@@ -151,6 +185,10 @@ def train_lstm(features: dict, y_crop: np.ndarray, y_pheno: np.ndarray,
                         num_workers=4, pin_memory=(device.type == "cuda"))
 
     model = CropPhenologyLSTM(hidden_dim=hidden_dim).to(device)
+    lstm_best_path = os.path.join(output_dir, "lstm_best.pt")
+    if os.path.exists(lstm_best_path):
+        model.load_state_dict(torch.load(lstm_best_path, map_location=device))
+        print(f"[lstm] Warm-starting from previous best model")
     opt   = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
 
@@ -200,6 +238,33 @@ def train_lstm(features: dict, y_crop: np.ndarray, y_pheno: np.ndarray,
                 os.path.join(output_dir, "lstm_config.pkl"))
     print(f"[lstm] Best loss={best_loss:.4f} | Models saved to {output_dir}")
 
+    # Validation pass on full dataset to estimate generalisation
+    model.eval()
+    val_c = val_p = val_n = 0
+    with torch.no_grad():
+        for x, lengths, doy, yc, yp in loader:
+            x, lengths = x.to(device), lengths.to(device)
+            doy = doy.squeeze(1).to(device)
+            yc, yp = yc.to(device), yp.to(device)
+            lc, lp = model(x, lengths, doy)
+            val_c += (lc.argmax(1) == yc).sum().item()
+            val_p += (lp.argmax(1) == yp).sum().item()
+            val_n += len(yc)
+    val_acc_crop  = val_c / val_n if val_n else 0
+    val_acc_pheno = val_p / val_n if val_n else 0
+    print(f"[lstm] Final val acc — crop={val_acc_crop:.3f}, pheno={val_acc_pheno:.3f}")
+
+    append_log(output_dir, {
+        "timestamp"       : datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "mode"            : "lstm",
+        "n_samples"       : val_n,
+        "train_acc_crop"  : "",
+        "train_acc_pheno" : "",
+        "val_acc_crop"    : round(val_acc_crop,  4),
+        "val_acc_pheno"   : round(val_acc_pheno, 4),
+        "best_loss"       : round(best_loss, 4),
+    })
+
 
 # ── MAIN ───────────────────────────────────────────────────────────────────────
 
@@ -219,10 +284,27 @@ def main():
                         help="Loss weight for crop head (0.4 matches scoring split)")
     args = parser.parse_args()
 
-    df                      = load_labels(args.label_csv)
+    df                        = load_labels(args.label_csv)
     tiff_index, region_bounds = build_tiff_index(args.tiff_dirs)
-    features                = extract_all_features(df, tiff_index, region_bounds)
+    features                  = extract_all_features(df, tiff_index, region_bounds)
     y_crop, y_pheno, le_crop, le_pheno = encode_labels(df)
+
+    # Drop out-of-bounds points (no matching TIFF region) — zero features corrupt training
+    mask = ~features["oob"]
+    n_dropped = features["oob"].sum()
+    if n_dropped:
+        print(f"[train] Dropping {n_dropped} out-of-bounds points, {mask.sum()} remain")
+    features = {
+        "flat"   : features["flat"][mask],
+        "seqs"   : [s for s, m in zip(features["seqs"], mask) if m],
+        "lengths": features["lengths"][mask],
+        "doys"   : features["doys"][mask],
+        "oob"    : features["oob"][mask],
+    }
+    y_crop  = y_crop[mask]
+    y_pheno = y_pheno[mask]
+
+    assert len(y_crop) > 0, "No in-bounds training samples — check label CSV coords vs TIFF regions"
 
     # Save label encoders (inference needs them)
     os.makedirs(args.output_dir, exist_ok=True)
