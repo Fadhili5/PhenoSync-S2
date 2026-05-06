@@ -1,3 +1,4 @@
 *.tiff
 *.tif
 test_output/
+DATA/

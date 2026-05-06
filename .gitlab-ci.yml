@@ -18,7 +18,7 @@ variables:
   # 请注意我们对模型的输出名称有要求具体请查询README文档
   # Please note that we have specific requirements for the model's output name. Kindly refer to the README document for details.
   # Startup command, you can modify it to your own startup command
-  START_CMD: "python train.py"
+  START_CMD: "bash /workspace/run.sh"
 
   # Algorithm parameters, name and description can be modified
   ALGO_NAME: "track1"
