@@ -135,15 +135,17 @@ def save_results(df: pd.DataFrame, crop_preds: list, pheno_preds: list,
     results = {}
     for i, (_, row) in enumerate(df.iterrows()):
         key = f"{row['Longitude']}_{row['Latitude']}_{str(row['phenophase_date']).strip()}"
-        if oob_mask[i]:
-            results[key] = ["background", "Dormancy"]
-        else:
-            results[key] = [crop_preds[i], pheno_preds[i]]
+        # Always use model prediction — even OOB points get real inference
+        # (zero-sequence input still yields a prediction from DOY encoding)
+        results[key] = [crop_preds[i], pheno_preds[i]]
 
     out_path = os.path.join(output_dir, "result.json")
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"[output] {len(results)} predictions -> {out_path}")
+    oob_n = int(oob_mask.sum()) if oob_mask is not None else 0
+    if oob_n:
+        print(f"[output] {oob_n} OOB points used model prediction (no TIFF coverage)")
 
 
 # ── OPTIONAL SCORING ───────────────────────────────────────────────────────────

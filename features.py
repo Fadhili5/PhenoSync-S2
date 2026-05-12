@@ -340,6 +340,15 @@ def extract_all_features(
         doy_raw  = datetime.strptime(obs_date, "%Y-%m-%d").timetuple().tm_yday
         doy_norm = doy_raw / 365.0
 
+        # OOB: no TIFF coverage — use DOY-encoded single timestep so model
+        # gets seasonal position signal instead of a dead-zero sequence.
+        if region is None:
+            doy_rad = 2 * math.pi * doy_raw / 365.0
+            oob_seq = np.zeros((1, SEQ_DIM), dtype=np.float32)
+            oob_seq[0, -2] = math.sin(doy_rad)
+            oob_seq[0, -1] = math.cos(doy_rad)
+            seq = oob_seq
+
         flat = np.append(_seq_to_flat(seq), doy_norm)  # 155 + 1 = 156
         flat_rows[i] = flat
         seqs.append(seq)
