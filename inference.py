@@ -154,9 +154,12 @@ def score_against_labels(result_json_path: str, label_csv_path: str):
     with open(result_json_path) as f:
         preds = json.load(f)
 
-    df_label = pd.read_csv(label_csv_path).dropna(
-        subset=["Pre_crop_type", "Pre_phenophase"]
-    )
+    df_label = pd.read_csv(label_csv_path)
+    # Accept both Pre_crop_type/Pre_phenophase and crop_type/phenophase_name
+    if "Pre_crop_type" in df_label.columns and "crop_type" not in df_label.columns:
+        df_label = df_label.rename(columns={"Pre_crop_type": "crop_type",
+                                            "Pre_phenophase": "phenophase_name"})
+    df_label = df_label.dropna(subset=["crop_type", "phenophase_name"])
 
     y_true_crop, y_pred_crop   = [], []
     y_true_pheno, y_pred_pheno = [], []
@@ -166,7 +169,7 @@ def score_against_labels(result_json_path: str, label_csv_path: str):
         if key not in preds:
             continue
         pred_crop, pred_pheno = preds[key]
-        true_crop, true_pheno = row["Pre_crop_type"], row["Pre_phenophase"]
+        true_crop, true_pheno = row["crop_type"], row["phenophase_name"]
 
         if true_crop in ("rice", "corn", "soybean"):
             y_true_crop.append(true_crop)
