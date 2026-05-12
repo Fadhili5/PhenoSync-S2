@@ -6,6 +6,7 @@ Handles multi-region TIFF indexing and efficient batch point sampling.
 import os
 import re
 import glob
+import math
 from collections import defaultdict
 from datetime import datetime
 
@@ -18,7 +19,27 @@ from rasterio.sample import sample_gen
 SENTINEL2_BANDS = ["B01", "B02", "B03", "B04", "B05", "B06",
                    "B07", "B08", "B8A", "B09", "B11", "B12"]
 
+N_BANDS   = len(SENTINEL2_BANDS)   # 12
+N_INDICES = 10                      # NDVI, LSWI, NDWI, EVI, RGVI, NDRE, CIre, CWC, NBR, LSWI_EVI
+N_DOY_ENC = 2                       # sin(2π·doy/365), cos(2π·doy/365) per timestep
+SEQ_DIM   = N_BANDS + N_INDICES + N_DOY_ENC  # 24 per timestep
+
 FLAT_STATS = ["mean", "std", "max", "min", "median", "diff_std"]
+
+# Fixed index positions in the 24-dim sequence vector
+IDX_NDVI     = N_BANDS + 0   # 12
+IDX_LSWI     = N_BANDS + 1   # 13
+IDX_NDWI     = N_BANDS + 2   # 14
+IDX_EVI      = N_BANDS + 3   # 15
+IDX_RGVI     = N_BANDS + 4   # 16
+IDX_NDRE     = N_BANDS + 5   # 17
+IDX_CIre     = N_BANDS + 6   # 18
+IDX_CWC      = N_BANDS + 7   # 19
+IDX_NBR      = N_BANDS + 8   # 20
+IDX_LSWI_EVI = N_BANDS + 9   # 21
+
+# Total flat feature dimension (6 stats × 24 + 11 pheno extras + 1 DOY)
+FLAT_DIM = SEQ_DIM * 6 + 11 + 1   # 156
 
 
 # ── TIFF INDEXING ──────────────────────────────────────────────────────────────
@@ -36,7 +57,7 @@ def parse_tiff_filename(filepath: str):
 def build_tiff_index(tiff_dirs) -> tuple:
     """
     Args:
-      tiff_dirs: str or list[str] — one or more directories containing TIFF files
+      tiff_dirs: str or list[str]
 
     Returns:
       tiff_index   : {(region, 'YYYY-MM-DD', band): filepath}
@@ -49,8 +70,11 @@ def build_tiff_index(tiff_dirs) -> tuple:
     region_bounds = {}
 
     for d in tiff_dirs:
+        # Scan directory itself + all subdirectories recursively
         files = (glob.glob(os.path.join(d, "*.tiff")) +
-                 glob.glob(os.path.join(d, "*.tif")))
+                 glob.glob(os.path.join(d, "*.tif"))  +
+                 glob.glob(os.path.join(d, "**", "*.tiff"), recursive=True) +
+                 glob.glob(os.path.join(d, "**", "*.tif"),  recursive=True))
         for f in files:
             parsed = parse_tiff_filename(f)
             if not parsed:
@@ -68,7 +92,6 @@ def build_tiff_index(tiff_dirs) -> tuple:
 
 
 def find_region_for_point(lon: float, lat: float, region_bounds: dict):
-    """Return region name whose bbox contains (lon, lat), else None."""
     for region, b in region_bounds.items():
         if b.left <= lon <= b.right and b.bottom <= lat <= b.top:
             return region
@@ -76,7 +99,6 @@ def find_region_for_point(lon: float, lat: float, region_bounds: dict):
 
 
 def csv_date_to_tiff_date(date_str: str) -> str:
-    """'YYYY/M/D' or 'YYYY-MM-DD' → 'YYYY-MM-DD'"""
     s = str(date_str).strip()
     if "/" in s:
         return datetime.strptime(s, "%Y/%m/%d").strftime("%Y-%m-%d")
@@ -94,23 +116,50 @@ def compute_indices(bands: dict) -> dict:
     def safe(a, b):
         return (a - b) / (a + b + 1e-9)
 
-    b2, b3, b4 = bands.get("B02", 0), bands.get("B03", 0), bands.get("B04", 0)
-    b8, b11    = bands.get("B08", 0), bands.get("B11", 0)
+    b2  = bands.get("B02", 0.0)
+    b3  = bands.get("B03", 0.0)
+    b4  = bands.get("B04", 0.0)
+    b5  = bands.get("B05", 0.0)
+    b7  = bands.get("B07", 0.0)
+    b8  = bands.get("B08", 0.0)
+    b8a = bands.get("B8A", 0.0)
+    b11 = bands.get("B11", 0.0)
+    b12 = bands.get("B12", 0.0)
+
+    ndvi = safe(b8, b4)
+    lswi = safe(b8, b11)
+    evi  = 2.5 * (b8 - b4) / (b8 + 6 * b4 - 7.5 * b2 + 1 + 1e-9)
 
     return {
-        "NDVI": safe(b8, b4),
-        "LSWI": safe(b8, b11),
-        "NDWI": safe(b3, b8),
-        "EVI" : 2.5 * (b8 - b4) / (b8 + 6*b4 - 7.5*b2 + 1 + 1e-9),
+        "NDVI"     : ndvi,
+        "LSWI"     : lswi,
+        "NDWI"     : safe(b3, b8),
+        "EVI"      : evi,
+        # Red-green VI — rice early growth / corn separability (Paper 2)
+        "RGVI"     : safe(b3, b4),
+        # Red-edge NDVI — nitrogen-sensitive, corn vs soybean (Paper 5)
+        "NDRE"     : safe(b8a, b5),
+        # Chlorophyll index red-edge — C4 corn vs soybean ~30% diff at peak (Paper 5)
+        "CIre"     : b7 / (b5 + 1e-9) - 1,
+        # Canopy water content using SWIR-2 — primary soybean discriminator (Paper 6)
+        "CWC"      : safe(b8a, b12),
+        # Normalized burn ratio — water stress proxy (Paper 6)
+        "NBR"      : safe(b8, b12),
+        # Flooding indicator: >0 means water/transplanting dominant (Papers 2, 3)
+        "LSWI_EVI" : lswi - evi,
     }
 
 
-def _feat_vec(bands: dict) -> np.ndarray:
-    """16-dim vector: 12 bands + 4 indices in fixed order."""
+def _feat_vec(bands: dict, doy_rad: float) -> np.ndarray:
+    """24-dim vector: 12 bands + 10 indices + 2 per-timestep sinusoidal DOY."""
     idx = compute_indices(bands)
     return np.array(
-        [bands.get(b, 0.0) for b in SENTINEL2_BANDS] +
-        [idx["NDVI"], idx["LSWI"], idx["NDWI"], idx["EVI"]],
+        [bands.get(b, 0.0) for b in SENTINEL2_BANDS] + [
+            idx["NDVI"],     idx["LSWI"],  idx["NDWI"],  idx["EVI"],
+            idx["RGVI"],     idx["NDRE"],  idx["CIre"],  idx["CWC"],
+            idx["NBR"],      idx["LSWI_EVI"],
+            math.sin(doy_rad), math.cos(doy_rad),
+        ],
         dtype=np.float32
     )
 
@@ -118,7 +167,6 @@ def _feat_vec(bands: dict) -> np.ndarray:
 # ── EFFICIENT BATCH SAMPLING ───────────────────────────────────────────────────
 
 def _batch_sample_tiff(tiff_path: str, coords: list) -> np.ndarray:
-    """Open TIFF once, sample all coords. Returns (n_coords,) array."""
     with rasterio.open(tiff_path) as src:
         vals = list(sample_gen(src, coords))
     return np.array([float(v[0]) if v.size > 0 else np.nan for v in vals],
@@ -126,13 +174,13 @@ def _batch_sample_tiff(tiff_path: str, coords: list) -> np.ndarray:
 
 
 def _extract_sequences_for_points(
-    unique_points: list,    # [(lon, lat), ...]
-    point_regions: list,    # [region or None, ...]
+    unique_points: list,
+    point_regions: list,
     tiff_index: dict,
     region_bounds: dict,
 ) -> list:
     """
-    For each unique point returns np.ndarray of shape (n_dates, 16).
+    For each unique point returns np.ndarray of shape (n_dates, SEQ_DIM=24).
     Batches reads per TIFF for efficiency.
     """
     available_dates_by_region = defaultdict(set)
@@ -141,22 +189,20 @@ def _extract_sequences_for_points(
     for r in available_dates_by_region:
         available_dates_by_region[r] = sorted(available_dates_by_region[r])
 
-    # Group points by region so we open each TIFF once per region
     region_to_point_idxs = defaultdict(list)
-    for i, (region, (lon, lat)) in enumerate(zip(point_regions, unique_points)):
+    for i, (region, _) in enumerate(zip(point_regions, unique_points)):
         if region and region in available_dates_by_region:
             region_to_point_idxs[region].append(i)
 
-    n_pts    = len(unique_points)
+    n_pts     = len(unique_points)
     sequences = [None] * n_pts
 
     for region, idxs in region_to_point_idxs.items():
         dates  = available_dates_by_region[region]
         coords = [unique_points[i] for i in idxs]
         n_d    = len(dates)
-        # band_matrix[i, d] = float value at point i on date-index d
-        band_data = np.zeros((len(coords), n_d, len(SENTINEL2_BANDS)), dtype=np.float32)
 
+        band_data = np.zeros((len(coords), n_d, N_BANDS), dtype=np.float32)
         for d_idx, date in enumerate(dates):
             for b_idx, band in enumerate(SENTINEL2_BANDS):
                 key = (region, date, band)
@@ -164,19 +210,23 @@ def _extract_sequences_for_points(
                     vals = _batch_sample_tiff(tiff_index[key], coords)
                     band_data[:, d_idx, b_idx] = vals
 
-        # Build (n_dates, 16) sequence per point
+        # Precompute per-timestep DOY radian for sinusoidal encoding
+        doy_rads = [
+            2 * math.pi * datetime.strptime(d, "%Y-%m-%d").timetuple().tm_yday / 365.0
+            for d in dates
+        ]
+
         for local_i, global_i in enumerate(idxs):
-            seq = np.zeros((n_d, 16), dtype=np.float32)
+            seq = np.zeros((n_d, SEQ_DIM), dtype=np.float32)
             for d_idx in range(n_d):
                 b = {SENTINEL2_BANDS[j]: float(band_data[local_i, d_idx, j])
-                     for j in range(len(SENTINEL2_BANDS))}
-                seq[d_idx] = _feat_vec(b)
+                     for j in range(N_BANDS)}
+                seq[d_idx] = _feat_vec(b, doy_rads[d_idx])
             sequences[global_i] = seq
 
-    # Out-of-bounds points get zero single-step sequence
     for i in range(n_pts):
         if sequences[i] is None:
-            sequences[i] = np.zeros((1, 16), dtype=np.float32)
+            sequences[i] = np.zeros((1, SEQ_DIM), dtype=np.float32)
 
     return sequences
 
@@ -185,16 +235,59 @@ def _extract_sequences_for_points(
 
 def _seq_to_flat(seq: np.ndarray) -> np.ndarray:
     """
-    (n_dates, 16) → flat vector of temporal stats.
-    Per feature: mean, std, max, min, median, diff_std → 6 stats × 16 = 96 features.
+    (n_dates, SEQ_DIM=24) → 155-dim flat vector.
+
+    Components:
+      6 temporal stats × 24 = 144
+      11 phenological/phase features
+    = 155 (observation DOY appended separately → FLAT_DIM=156 total)
     """
-    mean   = seq.mean(axis=0)
-    std    = seq.std(axis=0)
-    mx     = seq.max(axis=0)
-    mn     = seq.min(axis=0)
-    med    = np.median(seq, axis=0)
-    dstd   = np.diff(seq, axis=0).std(axis=0) if seq.shape[0] > 1 else np.zeros(16)
-    return np.concatenate([mean, std, mx, mn, med, dstd])  # 96-dim
+    T = seq.shape[0]
+
+    # Base temporal statistics (144 features)
+    mean = seq.mean(axis=0)
+    std  = seq.std(axis=0)
+    mx   = seq.max(axis=0)
+    mn   = seq.min(axis=0)
+    med  = np.median(seq, axis=0)
+    dstd = np.diff(seq, axis=0).std(axis=0) if T > 1 else np.zeros(SEQ_DIM, dtype=np.float32)
+
+    # Phenological timing (5 features)
+    ndvi_ts = seq[:, IDX_NDVI]
+    cwc_ts  = seq[:, IDX_CWC]
+    lswi_ts = seq[:, IDX_LSWI]
+    evi_ts  = seq[:, IDX_EVI]
+
+    doy_ndvi_peak  = float(np.argmax(ndvi_ts)) / max(T - 1, 1)
+    greenup_steps  = np.where(ndvi_ts > 0.2)[0]
+    doy_greenup    = float(greenup_steps[0]) / max(T - 1, 1) if len(greenup_steps) else 1.0
+    ndvi_amplitude = float(ndvi_ts.max() - ndvi_ts.min())
+    cwc_amplitude  = float(cwc_ts.max()  - cwc_ts.min())   # soybean pod-fill indicator
+
+    # Phase masks (Papers 2, 3)
+    flood_mask = (lswi_ts > evi_ts) & (ndvi_ts < 0.3)  # transplanting/flooded
+    grow_mask  = ndvi_ts > 0.4                           # active canopy
+
+    flooding_fraction = float(flood_mask.sum()) / max(T, 1)
+
+    def _pmean(ts, mask, fallback):
+        return float(ts[mask].mean()) if mask.any() else fallback
+
+    flood_mean_ndvi = _pmean(ndvi_ts, flood_mask, float(mean[IDX_NDVI]))
+    flood_mean_lswi = _pmean(lswi_ts, flood_mask, float(mean[IDX_LSWI]))
+    flood_mean_evi  = _pmean(evi_ts,  flood_mask, float(mean[IDX_EVI]))
+    grow_mean_ndvi  = _pmean(ndvi_ts, grow_mask,  float(mean[IDX_NDVI]))
+    grow_mean_evi   = _pmean(evi_ts,  grow_mask,  float(mean[IDX_EVI]))
+    grow_mean_cwc   = _pmean(cwc_ts,  grow_mask,  float(mean[IDX_CWC]))
+
+    pheno_extras = np.array([
+        doy_ndvi_peak,  doy_greenup,     ndvi_amplitude,  cwc_amplitude,
+        flooding_fraction,
+        flood_mean_ndvi, flood_mean_lswi, flood_mean_evi,
+        grow_mean_ndvi,  grow_mean_evi,   grow_mean_cwc,
+    ], dtype=np.float32)
+
+    return np.concatenate([mean, std, mx, mn, med, dstd, pheno_extras])  # 155-dim
 
 
 # ── MAIN ENTRY POINT ───────────────────────────────────────────────────────────
@@ -207,14 +300,12 @@ def extract_all_features(
     """
     Extract features for all rows in df.
 
-    Expects df columns: Longitude, Latitude, phenophase_date
-
     Returns dict:
-      'flat'   : np.ndarray (n_rows, 97)   — temporal stats + DOY (for XGBoost)
-      'seqs'   : list of np.ndarray         — (n_dates, 16) per row (for LSTM)
-      'lengths': np.ndarray (n_rows,)       — sequence lengths
-      'doys'   : np.ndarray (n_rows,)       — obs day-of-year, normalized [0,1]
-      'oob'    : np.ndarray bool (n_rows,)  — True if point outside all regions
+      'flat'   : np.ndarray (n_rows, FLAT_DIM=156)
+      'seqs'   : list of np.ndarray  — (n_dates, SEQ_DIM=24) per row
+      'lengths': np.ndarray (n_rows,)
+      'doys'   : np.ndarray (n_rows,)  — obs DOY normalized [0,1]
+      'oob'    : np.ndarray bool (n_rows,)
     """
     unique_lonlat = list(dict.fromkeys(
         zip(df["Longitude"].astype(float), df["Latitude"].astype(float))
@@ -232,8 +323,8 @@ def extract_all_features(
         unique_lonlat, unique_regions, tiff_index, region_bounds
     )
 
-    n = len(df)
-    flat_rows = np.zeros((n, 97), dtype=np.float32)
+    n         = len(df)
+    flat_rows = np.zeros((n, FLAT_DIM), dtype=np.float32)
     seqs      = []
     lengths   = np.zeros(n, dtype=np.int64)
     doys      = np.zeros(n, dtype=np.float32)
@@ -249,7 +340,7 @@ def extract_all_features(
         doy_raw  = datetime.strptime(obs_date, "%Y-%m-%d").timetuple().tm_yday
         doy_norm = doy_raw / 365.0
 
-        flat = np.append(_seq_to_flat(seq), doy_norm)  # 96 + 1 = 97
+        flat = np.append(_seq_to_flat(seq), doy_norm)  # 155 + 1 = 156
         flat_rows[i] = flat
         seqs.append(seq)
         lengths[i] = seq.shape[0]

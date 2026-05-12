@@ -6,7 +6,7 @@ import pandas as pd
 import joblib
 import torch
 
-from features import build_tiff_index, extract_all_features
+from features import build_tiff_index, extract_all_features, SEQ_DIM
 from model import CropPhenologyLSTM, CROP_CLASSES, PHENO_CLASSES
 
 
@@ -16,6 +16,8 @@ def load_test_points(csv_path: str) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
     for col in ("Longitude", "Latitude", "phenophase_date"):
         assert col in df.columns, f"Missing column: {col}"
+    # Drop rows missing required geo/date fields only
+    df = df.dropna(subset=["Longitude", "Latitude", "phenophase_date"])
     print(f"[data] {len(df)} rows from {csv_path}")
     return df
 
@@ -26,13 +28,12 @@ def load_models(model_dir: str) -> dict:
     """
     Auto-detects which model(s) are available in model_dir.
     Priority: lstm_best.pt > xgb_crop.pkl
-    Returns dict with loaded objects.
     """
     models = {}
     enc_path = os.path.join(model_dir, "label_encoders.pkl")
     if os.path.exists(enc_path):
         models["encoders"] = joblib.load(enc_path)
-        print(f"[model] Label encoders loaded")
+        print("[model] Label encoders loaded")
 
     lstm_path = os.path.join(model_dir, "lstm_best.pt")
     cfg_path  = os.path.join(model_dir, "lstm_config.pkl")
@@ -56,7 +57,7 @@ def load_models(model_dir: str) -> dict:
         remap_path = os.path.join(model_dir, "xgb_remapper.pkl")
         if os.path.exists(remap_path):
             models["xgb_remapper"] = joblib.load(remap_path)
-        print(f"[model] XGBoost models loaded")
+        print("[model] XGBoost models loaded")
         return models
 
     print(f"[warn] No trained models found in {model_dir} — using placeholder predictions")
@@ -83,10 +84,10 @@ def run_inference(features: dict, models: dict) -> tuple:
         all_c, all_p = [], []
         batch = 256
         for start in range(0, n, batch):
-            end  = min(start + batch, n)
-            sl   = slice(start, end)
-            B    = end - start
-            padded = np.zeros((B, max_len, 16), dtype=np.float32)
+            end    = min(start + batch, n)
+            sl     = slice(start, end)
+            B      = end - start
+            padded = np.zeros((B, max_len, SEQ_DIM), dtype=np.float32)
             lens   = np.zeros(B, dtype=np.int64)
             for i, seq in enumerate(seqs[sl]):
                 L = min(len(seq), max_len)
@@ -108,12 +109,11 @@ def run_inference(features: dict, models: dict) -> tuple:
 
     # ── XGBoost ──
     if "xgb_crop" in models:
-        X       = features["flat"]
-        c_idx   = models["xgb_crop"].predict(X)
-        p_idx   = models["xgb_pheno"].predict(X)
+        X        = features["flat"]
+        c_idx    = models["xgb_crop"].predict(X)
+        p_idx    = models["xgb_pheno"].predict(X)
         remapper = models.get("xgb_remapper")
         if remapper and le_crop and le_pheno:
-            # decode: xgb 0-indexed → original label-encoder indices → class names
             c_orig = remapper["crop"].inverse_transform(c_idx)
             p_orig = remapper["pheno"].inverse_transform(p_idx)
             crop_preds  = le_crop.inverse_transform(c_orig).tolist()
@@ -143,7 +143,7 @@ def save_results(df: pd.DataFrame, crop_preds: list, pheno_preds: list,
     out_path = os.path.join(output_dir, "result.json")
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
-    print(f"[output] {len(results)} predictions → {out_path}")
+    print(f"[output] {len(results)} predictions -> {out_path}")
 
 
 # ── OPTIONAL SCORING ───────────────────────────────────────────────────────────
@@ -199,10 +199,8 @@ def main():
     parser.add_argument("--input_csv",  required=True)
     parser.add_argument("--tiff_dir",   required=True)
     parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--model_dir",  default="models",
-                        help="Directory containing trained model files")
-    parser.add_argument("--label_csv",  default=None,
-                        help="Optional label CSV for local scoring")
+    parser.add_argument("--model_dir",  default="models")
+    parser.add_argument("--label_csv",  default=None)
     args = parser.parse_args()
 
     df                        = load_test_points(args.input_csv)
@@ -222,4 +220,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-```
