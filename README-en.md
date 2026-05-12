@@ -68,10 +68,10 @@ PhenoSync-S2/
 │
 ├── DATA/                  # ← Place training data here before training
 │   ├── points_train_label.csv
-│   ├── region_train_1/    (from track1_download_link_5)
-│   ├── region_train_2/    (from track1_download_link_4, if available)
-│   ├── region_train_3/    (from track1_download_link_3)
-│   └── region_train_4/    (from track1_download_link_2)
+│   ├── region_train_1/
+│   ├── region_train_2/
+│   ├── region_train_3/
+│   └── region_train_4/
 │
 ├── models/                # ← Trained weights saved here (commit before pushing)
 │   ├── lstm_best.pt
@@ -117,8 +117,8 @@ DATA/
 │
 ├── region_train_1/                 # Flat directory of TIFF files
 │   ├── region00_2018-06-07-00-00_..._Sentinel-2_L2A_B01_(Raw).tiff
-│   ├── region00_2018-06-07-00-00_..._Sentinel-2_L2A_B02_(Raw).tiff
 │   └── ...  (12 bands × all dates × all sub-regions, ~2500 files per dir)
+├── region_train_2/
 ├── region_train_3/
 └── region_train_4/
 ```
@@ -139,7 +139,7 @@ regionXX_YYYY-MM-DD-00-00_YYYY-MM-DD-23-59_Sentinel-2_L2A_BXX_(Raw).tiff
 ```powershell
 python train.py --mode xgboost `
     --label_csv DATA\points_train_label.csv `
-    --tiff_dirs DATA\region_train_1 DATA\region_train_3 DATA\region_train_4 `
+    --tiff_dirs DATA\region_train_1 DATA\region_train_2 DATA\region_train_3 DATA\region_train_4 `
     --output_dir models
 ```
 
@@ -157,7 +157,7 @@ Expected output:
 ```powershell
 python train.py --mode lstm `
     --label_csv DATA\points_train_label.csv `
-    --tiff_dirs DATA\region_train_1 DATA\region_train_3 DATA\region_train_4 `
+    --tiff_dirs DATA\region_train_1 DATA\region_train_2 DATA\region_train_3 DATA\region_train_4 `
     --output_dir models `
     --epochs 80 `
     --batch_size 64 `
@@ -173,16 +173,6 @@ Expected output per epoch:
 ```
 
 Training stops early if validation loss stops improving (patience = 15 epochs).
-
-**If `region_train_2` data arrives later**, add it and retrain — warm-start picks up from existing weights:
-
-```powershell
-python train.py --mode lstm `
-    --label_csv DATA\points_train_label.csv `
-    --tiff_dirs DATA\region_train_1 DATA\region_train_2 DATA\region_train_3 DATA\region_train_4 `
-    --output_dir models `
-    --epochs 80 --batch_size 64 --hidden_dim 128
-```
 
 ### Training Arguments
 
