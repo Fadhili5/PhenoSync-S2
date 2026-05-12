@@ -111,7 +111,7 @@ def main():
 
     # Print ready-to-run training commands
     tiff_dirs_arg = " ".join(f'DATA\\{os.path.basename(d)}' for d in extracted_dirs if os.path.isdir(d))
-    lbl = "test_input_sample\\test_data_label_sample.csv"
+    lbl = f"DATA\\{LABEL_CSV_INSIDE}" if label_csv_path else "<label_csv_path>"
 
     print("\n" + "="*60)
     print("TRAINING COMMANDS")

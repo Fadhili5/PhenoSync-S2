@@ -66,7 +66,8 @@ PhenoSync-S2/
 ├── requirements.txt       # Python dependencies
 ├── setup_data.py          # Zip extraction helper (if data arrives zipped)
 │
-├── DATA/                  # ← Place training TIFF data here before training
+├── DATA/                  # ← Place training data here before training
+│   ├── points_train_label.csv
 │   ├── region_train_1/    (from track1_download_link_5)
 │   ├── region_train_2/    (from track1_download_link_4, if available)
 │   ├── region_train_3/    (from track1_download_link_3)
@@ -109,17 +110,17 @@ Place extracted training data under `DATA/`:
 
 ```
 DATA/
+├── points_train_label.csv          # 5,446 labeled rows
+│                                   # Columns: point_id, Longitude, Latitude,
+│                                   #          phenophase_date, crop_type, phenophase_name
+│                                   # Crop dist: rice=2569  corn=1603  soybean=1274
+│
 ├── region_train_1/                 # Flat directory of TIFF files
 │   ├── region00_2018-06-07-00-00_..._Sentinel-2_L2A_B01_(Raw).tiff
 │   ├── region00_2018-06-07-00-00_..._Sentinel-2_L2A_B02_(Raw).tiff
 │   └── ...  (12 bands × all dates × all sub-regions, ~2500 files per dir)
 ├── region_train_3/
 └── region_train_4/
-
-test_input_sample/
-└── test_data_label_sample.csv      # Training labels
-    # Columns: point_id, Longitude, Latitude, phenophase_date,
-    #          Pre_crop_type, Pre_phenophase
 ```
 
 **TIFF filename format** (parsed automatically):
@@ -137,7 +138,7 @@ regionXX_YYYY-MM-DD-00-00_YYYY-MM-DD-23-59_Sentinel-2_L2A_BXX_(Raw).tiff
 
 ```powershell
 python train.py --mode xgboost `
-    --label_csv test_input_sample\test_data_label_sample.csv `
+    --label_csv DATA\points_train_label.csv `
     --tiff_dirs DATA\region_train_1 DATA\region_train_3 DATA\region_train_4 `
     --output_dir models
 ```
@@ -155,7 +156,7 @@ Expected output:
 
 ```powershell
 python train.py --mode lstm `
-    --label_csv test_input_sample\test_data_label_sample.csv `
+    --label_csv DATA\points_train_label.csv `
     --tiff_dirs DATA\region_train_1 DATA\region_train_3 DATA\region_train_4 `
     --output_dir models `
     --epochs 80 `
@@ -177,7 +178,7 @@ Training stops early if validation loss stops improving (patience = 15 epochs).
 
 ```powershell
 python train.py --mode lstm `
-    --label_csv test_input_sample\test_data_label_sample.csv `
+    --label_csv DATA\points_train_label.csv `
     --tiff_dirs DATA\region_train_1 DATA\region_train_2 DATA\region_train_3 DATA\region_train_4 `
     --output_dir models `
     --epochs 80 --batch_size 64 --hidden_dim 128
@@ -232,7 +233,7 @@ python inference.py `
     --tiff_dir   test_input_sample\region_test `
     --output_dir output `
     --model_dir  models `
-    --label_csv  test_input_sample\test_data_label_sample.csv
+    --label_csv  DATA\points_train_label.csv
 ```
 
 Prints:
