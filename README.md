@@ -4,17 +4,6 @@ Multi-temporal Sentinel-2 crop classification and rice phenology staging.
 Predicts **crop type** (rice / corn / soybean / background) and **phenological stage**
 (Greenup → Dormancy) for every input point × date combination.
 
-## Scoring Formula
-
-```
-AlgoScore    = 0.4 × Crop_MacroF1  +  0.6 × RicePhenology_MacroF1
-Final Score  = AlgoScore × 60%  +  Solution Design × 40%
-```
-
-Rice phenology F1 is weighted higher (0.6) — rice crop classification accuracy is a prerequisite since phenology is only scored when the crop prediction is correct.
-
----
-
 ## Repository Structure
 
 ```
@@ -224,63 +213,6 @@ Output:
 
 ---
 
-## 5. Platform Submission Workflow
-
-The competition platform is **inference-only**. Training must be done locally. Commit trained weights to `models/` and push to `main` — this triggers the CI/CD pipeline, which runs inference inside the Docker container.
-
-**Limit: 3 submissions per day.**
-
-### Full workflow
-
-```
-1. Place training data in DATA/
-2. python train.py --mode xgboost ...   → trains XGBoost, saves to models/
-3. python train.py --mode lstm ...      → trains LSTM, saves to models/
-4. python inference.py ... --label_csv  → verify AlgoScore locally
-5. git add models/
-6. git commit -m "Add trained model weights"
-7. git push origin main                 → triggers CI/CD (counts as 1 submission)
-```
-
-### Pre-push checklist
-
-- [ ] `models/lstm_best.pt` exists and is non-zero
-- [ ] `models/xgb_crop.pkl` and `models/xgb_pheno.pkl` exist
-- [ ] `models/label_encoders.pkl` and `models/lstm_config.pkl` exist
-- [ ] Local inference completes without errors
-- [ ] `result.json` covers **all rows** in the test CSV
-- [ ] Date keys use original format (`2018/9/1` not `2018-09-01`)
-- [ ] AlgoScore is reasonable (not 0 or suspiciously low)
-
-### Simulate platform locally with Docker
-
-Build and run the container exactly as the platform does:
-
-```powershell
-docker build -t phenosync-s2 .
-
-docker run --rm `
-    -v "${PWD}\test_input_sample:/input" `
-    -v "${PWD}\output_docker:/output" `
-    phenosync-s2
-
-# Inspect output
-cat output_docker\result.json
-```
-
-### Platform paths (handled automatically by `run.sh`)
-
-| Container path | Content |
-|----------------|---------|
-| `/input/test_point.csv` | Test coordinates + dates |
-| `/input/region_test/` | Test TIFF files |
-| `/workspace/models/` | Trained weights (bundled in image at build time) |
-| `/output/result.json` | Required output — must exist after container exits |
-
-`run.sh` auto-detects the TIFF directory under `/input/` and falls back gracefully if the directory name differs from `region_test`.
-
----
-
 ## 6. Model Architecture
 
 ### Feature vector — 24 dimensions per timestep
@@ -362,39 +294,3 @@ The attention pooling mechanism allows the model to selectively weight timesteps
 
 **Important:** Rice phenology is only scored when the crop prediction is also correct. Improving crop F1 — especially rice recall — directly improves the phenology component of AlgoScore.
 
----
-
-## 8. Performance Tips
-
-- **Low rice recall:** Check LSWI−EVI flooding fraction. Rice transplanting window (LSWI−EVI > 0) is the most discriminative rice feature. If in-bounds observations are sparse during June–July, the model may miss rice.
-- **Low pheno F1:** Verify the LSTM is using `lstm_best.pt` not `lstm_final.pt`. The best checkpoint (by val loss) usually generalizes better.
-- **Improving corn/soy separation:** NDRE and CIre red-edge bands are the primary separators. Check that B05, B07, B8A bands are loading correctly.
-- **Score plateau after epoch 20:** Try reducing `--lr` to `5e-4` or increasing `--hidden_dim` to 256 for more model capacity.
-- **Sparse observations:** Points near cloud-heavy regions may have few valid timesteps. The DOY-encoded sequence approach handles this, but very sparse points (<3 valid dates) will degrade accuracy.
-
----
-
-## 9. Troubleshooting
-
-| Problem | Cause | Fix |
-|---------|-------|-----|
-| `ModuleNotFoundError` | Missing package | `pip install -r requirements.txt` |
-| `0 in-bounds` points | Wrong `--tiff_dir` path | Verify path exists and contains `.tiff` files |
-| All predictions = `background` | No trained models found | Run training first, then inference |
-| `result.json` missing keys | NaN in Longitude/Latitude | Inspect input CSV for malformed rows |
-| Score = 0 on platform | Wrong output path or filename | Must be `/output/result.json` exactly |
-| Low pheno F1 | Crop misclassified (not rice) | Phenology only scored when crop = rice; fix crop F1 first |
-| CUDA out of memory | Batch too large | Reduce `--batch_size` to 32 or 16 |
-| `result.json` date keys wrong | Date reformatted by pandas | Keys must match input CSV exactly — code preserves raw string |
-| Training stalls at same loss | Learning rate too high | Try `--lr 5e-4` or add warmup |
-| Platform CI fails | Models not committed | `git add models/` before push |
-
----
-
-## 10. Platform Notes
-
-- Each `git push origin main` counts as one submission. Limit is **3 per day**.
-- The platform runs inference only — no training occurs in the container.
-- Container has no internet access. All dependencies must be in the Docker image.
-- Output file must be at `/output/result.json` — any other path or name scores zero.
-- To create a GitLab access token for pushing: **Avatar → Edit Profile → Access Tokens**.
