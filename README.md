@@ -1,40 +1,400 @@
-我们已经为您创建好参加itu比赛的初始项目，编写好了对应的.gitlab-ci.yml，您提交代码到main分支或是新建流水线将会触发创建训练任务的动作，之后您可到网页端查看您的项目状态和运行日志，请注意每天只可提交3次，超过次数后将不再提交任务。
+# PhenoSync-S2 — Track 1: Crop Type & Phenology Classification
 
-我们的gitlab支持使用zero2x的平台账号登录，但此账号不支持使用git推送代码或使用docker拉取镜像，这需要您创建自己的token作为密码进行操作，请到头像>Edit Profile>Access Tokens创建自己的token，具体操作可查询极狐GitLab官方文档。
+Multi-temporal Sentinel-2 crop classification and rice phenology staging.
+Predicts **crop type** (rice / corn / soybean / background) and **phenological stage**
+(Greenup → Dormancy) for every input point × date combination.
 
-您需要注意的是.gitlab-ci.yml中有数据集路径、模型输出地址、启动命令，这些可自行修改，代码中的路径需要与.gitlab-ci.yml中保持一直，请只修改容器挂载路径，实际的路径请勿修改，避免与其他参赛选手冲突。
+## Scoring Formula
 
-我们对您的输出结果的文件命名也有要求，请务必遵循，否则会影响到您提交的模型的最终评分
-赛道一的输出：
-
-/你的容器输出路径/result.json
-
-赛道二的输出：
-
-/你的容器输出路径/turbidity_result.json
-
-/你的容器输出路径/chla_result.json
-
-赛道三的输出：
-
-/你的容器输出路径/result.json
-
-赛事使用的基础镜像路径编写在了Dockerfile，若您需要使用基础镜像进行本地调试，可搜索*itu_docker_images*项目，此项目的container registry上传了赛事使用的基础镜像，也可使用docker 拉取。
-
-```bash
-sudo vim /etc/docker/daemon.json
-
-{
-  "insecure-registries": ["gitlab-itu.zero2x.org:5050"]
-}
-
-systemctl daemon-reload
-systemctl restart docker
-
-docker login http://gitlab-itu.zero2x.org:5050
-
-docker pull gitlab-itu.zero2x.org:5050/itu_images/itu_docker_images:ubuntu22.04-py310.19
-docker pull gitlab-itu.zero2x.org:5050/itu_images/itu_docker_images:ubuntu22.04-cuda12.3.2-cudnn9-py310.19
-docker pull gitlab-itu.zero2x.org:5050/itu_images/itu_docker_images/competition-base:pytorch2.5.1-cuda12.1-cudnn9
+```
+AlgoScore    = 0.4 × Crop_MacroF1  +  0.6 × RicePhenology_MacroF1
+Final Score  = AlgoScore × 60%  +  Solution Design × 40%
 ```
 
+Rice phenology F1 is weighted higher (0.6) — rice crop classification accuracy is a prerequisite since phenology is only scored when the crop prediction is correct.
+
+---
+
+## Repository Structure
+
+```
+PhenoSync-S2/
+├── features.py             # Spectral indices, temporal stats, phase-gated features
+├── model.py                # BiLSTM + multi-head attention architecture
+├── train.py                # Training script (XGBoost + LSTM modes)
+├── inference.py            # Inference + result.json export
+├── run.sh                  # Container entry point (platform use only)
+├── Dockerfile              # Docker image — bundles code + trained weights
+├── requirements.txt        # Python dependencies
+├── setup_data.py           # Zip extraction helper (if data arrives zipped)
+│
+├── DATA/                   # Place training data here before training
+│   ├── points_train_label.csv
+│   ├── region_train_1/
+│   ├── region_train_2/
+│   ├── region_train_3/
+│   └── region_train_4/
+│
+├── models/                 # Trained weights saved here (commit before pushing)
+│   ├── lstm_best.pt
+│   ├── lstm_final.pt
+│   ├── lstm_config.pkl
+│   ├── xgb_crop.pkl
+│   ├── xgb_pheno.pkl
+│   ├── xgb_remapper.pkl
+│   └── label_encoders.pkl
+│
+└── test_input_sample/      # Local test data (mirrors /input on platform)
+    ├── test_point.csv
+    ├── test_data_label_sample.csv
+    └── region_test/
+```
+
+---
+
+## 1. Environment Setup
+
+Python 3.10+. CUDA GPU strongly recommended for LSTM training.
+
+```powershell
+pip install -r requirements.txt
+```
+
+Or manually:
+
+```powershell
+pip install numpy pandas scikit-learn torch xgboost joblib rasterio
+```
+
+> For CUDA support, install PyTorch with the appropriate CUDA version from https://pytorch.org/get-started/locally/
+
+---
+
+## 2. Data Layout
+
+Place extracted training data under `DATA/`:
+
+```
+DATA/
+├── points_train_label.csv          # 5,446 labeled rows
+│                                   # Columns: point_id, Longitude, Latitude,
+│                                   #          phenophase_date, crop_type, phenophase_name
+│                                   # Crop distribution: rice=2569  corn=1603  soybean=1274
+│
+├── region_train_1/                 # Flat directory of TIFF files
+│   ├── region00_2018-06-07-00-00_..._Sentinel-2_L2A_B01_(Raw).tiff
+│   └── ...  (12 bands × all dates × all sub-regions, ~2500 files per dir)
+├── region_train_2/
+├── region_train_3/
+└── region_train_4/
+```
+
+**TIFF filename format** (parsed automatically):
+```
+regionXX_YYYY-MM-DD-00-00_YYYY-MM-DD-23-59_Sentinel-2_L2A_BXX_(Raw).tiff
+```
+
+> If data arrived as `.zip` files, run `python setup_data.py` to extract everything and print ready-to-run training commands.
+
+---
+
+## 3. Training
+
+Training is a two-stage pipeline. Run XGBoost first (fast, validates data pipeline), then LSTM (higher accuracy, GPU recommended).
+
+### Stage 1 — XGBoost (CPU, ~10–30 min)
+
+XGBoost operates on 156-dimensional flat feature vectors (temporal statistics across all timesteps). Good baseline, fast iteration.
+
+```powershell
+python train.py --mode xgboost `
+    --label_csv DATA\points_train_label.csv `
+    --tiff_dirs DATA\region_train_1 DATA\region_train_2 DATA\region_train_3 DATA\region_train_4 `
+    --output_dir models
+```
+
+Expected terminal output:
+```
+[index]    7698 TIFFs | 3 regions | N dates
+[features] 5446 samples | XXXX in-bounds
+[features] flat shape=(5446, 156) | max_seq_len=N | oob=X
+[xgb]      Train acc — crop=0.9XX  pheno=0.9XX
+[log]      Run appended → models/training_log.csv
+```
+
+### Stage 2 — BiLSTM (GPU recommended, ~1–3 hours for 80 epochs)
+
+BiLSTM processes full temporal sequences (T × 24-dim feature vectors). Learns phenological trajectories that flat statistics miss.
+
+```powershell
+python train.py --mode lstm `
+    --label_csv DATA\points_train_label.csv `
+    --tiff_dirs DATA\region_train_1 DATA\region_train_2 DATA\region_train_3 DATA\region_train_4 `
+    --output_dir models `
+    --epochs 80 `
+    --batch_size 64 `
+    --hidden_dim 128
+```
+
+Expected output per epoch:
+```
+[lstm] Epoch 001/080 | train_loss=1.2341 | val_loss=1.1890 | crop_acc=0.612 | val_crop=0.634 | val_pheno=0.521 | trm=0.02
+[lstm] Epoch 010/080 | train_loss=0.8123 | val_loss=0.7654 | crop_acc=0.781 | val_crop=0.803 | val_pheno=0.742 | trm=0.20
+...
+[lstm] Best val loss=0.4123 | Models saved to models
+```
+
+Early stopping triggers after 15 epochs without validation loss improvement.
+
+### Training Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--mode` | required | `xgboost` or `lstm` |
+| `--label_csv` | required | Path to labeled training CSV |
+| `--tiff_dirs` | required | One or more TIFF directories (space-separated) |
+| `--output_dir` | `models` | Where to save model weights |
+| `--epochs` | `50` | LSTM training epochs |
+| `--batch_size` | `64` | LSTM batch size (reduce to 32/16 if OOM) |
+| `--hidden_dim` | `128` | LSTM hidden units per direction (BiLSTM = ×2) |
+| `--lr` | `1e-3` | AdamW learning rate |
+| `--weight_crop` | `0.4` | Crop loss weight (phenology gets remaining 0.6) |
+
+### Output files saved to `models/`
+
+| File | Description |
+|------|-------------|
+| `lstm_best.pt` | Best LSTM weights by validation loss |
+| `lstm_final.pt` | Final epoch weights |
+| `lstm_config.pkl` | Architecture config — required for inference |
+| `xgb_crop.pkl` | XGBoost crop classifier |
+| `xgb_pheno.pkl` | XGBoost phenology classifier |
+| `xgb_remapper.pkl` | Label index remapper |
+| `label_encoders.pkl` | Class name encoders — required for inference |
+| `training_log.csv` | Accuracy history across all runs |
+
+---
+
+## 4. Local Inference
+
+### Basic inference (no scoring)
+
+```powershell
+python inference.py `
+    --input_csv  test_input_sample\test_point.csv `
+    --tiff_dir   test_input_sample\region_test `
+    --output_dir output `
+    --model_dir  models
+```
+
+### Inference with local scoring
+
+Requires a label CSV with ground truth. Prints Crop MacroF1, Rice Phenology MacroF1, and AlgoScore locally so you can verify quality before submitting.
+
+```powershell
+python inference.py `
+    --input_csv  test_input_sample\test_point.csv `
+    --tiff_dir   test_input_sample\region_test `
+    --output_dir output `
+    --model_dir  models `
+    --label_csv  DATA\points_train_label.csv
+```
+
+Output:
+```
+[score] Crop MacroF1=0.XXXX  (n=XXX)
+[score] Rice Phenology MacroF1=0.XXXX  (n=XXX)
+[score] AlgoScore=XX.XX
+```
+
+### Output format — `output/result.json`
+
+```json
+{
+  "124.703696_48.543523_2018/9/1":    ["rice",    "Maturity"],
+  "125.331726_48.768485_2018/6/21":   ["corn",    "Greenup"],
+  "125.331726_48.768485_2018/7/31":   ["soybean", "Peak"],
+  ...
+}
+```
+
+**Key format:** `{Longitude}_{Latitude}_{phenophase_date}`
+
+**Critical:** The date string must be preserved **exactly** as it appears in the input CSV (e.g. `2018/9/1` — **not** `2018-09-01`). Every row in the input CSV must have a corresponding key. Missing keys are penalized.
+
+---
+
+## 5. Platform Submission Workflow
+
+The competition platform is **inference-only**. Training must be done locally. Commit trained weights to `models/` and push to `main` — this triggers the CI/CD pipeline, which runs inference inside the Docker container.
+
+**Limit: 3 submissions per day.**
+
+### Full workflow
+
+```
+1. Place training data in DATA/
+2. python train.py --mode xgboost ...   → trains XGBoost, saves to models/
+3. python train.py --mode lstm ...      → trains LSTM, saves to models/
+4. python inference.py ... --label_csv  → verify AlgoScore locally
+5. git add models/
+6. git commit -m "Add trained model weights"
+7. git push origin main                 → triggers CI/CD (counts as 1 submission)
+```
+
+### Pre-push checklist
+
+- [ ] `models/lstm_best.pt` exists and is non-zero
+- [ ] `models/xgb_crop.pkl` and `models/xgb_pheno.pkl` exist
+- [ ] `models/label_encoders.pkl` and `models/lstm_config.pkl` exist
+- [ ] Local inference completes without errors
+- [ ] `result.json` covers **all rows** in the test CSV
+- [ ] Date keys use original format (`2018/9/1` not `2018-09-01`)
+- [ ] AlgoScore is reasonable (not 0 or suspiciously low)
+
+### Simulate platform locally with Docker
+
+Build and run the container exactly as the platform does:
+
+```powershell
+docker build -t phenosync-s2 .
+
+docker run --rm `
+    -v "${PWD}\test_input_sample:/input" `
+    -v "${PWD}\output_docker:/output" `
+    phenosync-s2
+
+# Inspect output
+cat output_docker\result.json
+```
+
+### Platform paths (handled automatically by `run.sh`)
+
+| Container path | Content |
+|----------------|---------|
+| `/input/test_point.csv` | Test coordinates + dates |
+| `/input/region_test/` | Test TIFF files |
+| `/workspace/models/` | Trained weights (bundled in image at build time) |
+| `/output/result.json` | Required output — must exist after container exits |
+
+`run.sh` auto-detects the TIFF directory under `/input/` and falls back gracefully if the directory name differs from `region_test`.
+
+---
+
+## 6. Model Architecture
+
+### Feature vector — 24 dimensions per timestep
+
+**12 Sentinel-2 raw bands:** B01 B02 B03 B04 B05 B06 B07 B08 B8A B09 B11 B12
+
+**10 spectral indices:**
+
+| Index | Formula | Why it matters |
+|-------|---------|----------------|
+| NDVI | (B08−B04)/(B08+B04) | Vegetation density, primary growth signal |
+| LSWI | (B08−B11)/(B08+B11) | Leaf water content, flooding detection |
+| NDWI | (B03−B08)/(B03+B08) | Open water surface |
+| EVI | 2.5×(B08−B04)/(B08+6B04−7.5B02+1) | Canopy LAI, less saturated than NDVI |
+| RGVI | (B03−B04)/(B03+B04) | Early-season rice growth signal |
+| NDRE | (B8A−B05)/(B8A+B05) | Nitrogen status — strong corn/soy separator |
+| CIre | B07/B05 − 1 | Chlorophyll red-edge — C4 corn vs. soybean |
+| CWC | (B8A−B12)/(B8A+B12) | Canopy water via SWIR-2 — key soybean indicator |
+| NBR | (B08−B12)/(B08+B12) | Water stress, SWIR-2 based |
+| LSWI−EVI | LSWI − EVI | >0 signals flooded/transplanting (rice transplant indicator) |
+
+**2 positional encodings:** `sin(2π·doy/365)`, `cos(2π·doy/365)` — encodes calendar position of each timestep
+
+### XGBoost flat features (156-dim)
+
+- 6 temporal statistics × 24 features = 144 dims: `mean, std, max, min, median, temporal diff_std`
+- Phenological timing: DOY of NDVI peak, DOY of greenup, NDVI amplitude, CWC amplitude, flooding fraction
+- Phase-gated means: NDVI/LSWI/EVI during transplanting phase; NDVI/EVI/CWC during growing phase
+- 1 observation DOY (query date)
+
+### BiLSTM architecture
+
+```
+Input (B, T, 24)
+    │
+BiLSTM — 128 hidden × 2 directions → (B, T, 256)
+    │
+MultiHeadAttentionPool — 2 heads → (B, 256)
+    │
+DOY sinusoidal encoding — 4-dim [sin, cos, sin2x, cos2x] → concat → (B, 260)
+    │
+    ├── Crop Head:  Linear(260→128) → LayerNorm → ReLU → Linear(128→64) → Linear(64→4)
+    └── Pheno Head: Linear(260→128) → LayerNorm → ReLU → Linear(128→64) → Linear(64→7)
+
+Outputs: crop logits (4) + phenology logits (7)
+```
+
+The attention pooling mechanism allows the model to selectively weight timesteps — e.g., it learns to upweight transplanting-phase observations for rice phenology, and NDRE-peak windows for corn.
+
+### Training techniques
+
+| Technique | Detail | Purpose |
+|-----------|--------|---------|
+| Temporal Random Masking | 0→20% curriculum over 10 epochs | Cloud-gap robustness — simulates missing observations |
+| Stratified 80/20 val split | Stratified by crop class | Honest generalization estimate across all classes |
+| Early stopping | Patience=15 on val loss | Prevent overfitting |
+| Class-weighted CrossEntropyLoss | sklearn `compute_class_weight` | Balances minority class (soybean) learning |
+| WeightedRandomSampler | Per-sample weight from class frequency | Balanced mini-batches during training |
+| CosineAnnealingLR | T_max = total epochs | Smooth LR decay toward zero |
+| AdamW optimizer | Default lr=1e-3, weight_decay | Better generalization than Adam |
+
+---
+
+## 7. Crop Classes & Phenology Stages
+
+**Crop classes (4):** `rice` `corn` `soybean` `background`
+
+**Phenology stages (7):**
+
+| Stage | Description | Typical NDVI range |
+|-------|-------------|-------------------|
+| Greenup | Vegetation emergence, NDVI rising from baseline | 0.2–0.4 |
+| MidGreenup | Rapid canopy development | 0.4–0.6 |
+| Peak | Maximum NDVI / canopy closure | 0.7–0.9 |
+| Maturity | Canopy stable, grain-filling underway | 0.6–0.8 |
+| Senescence | NDVI declining, crop aging | 0.4–0.6 |
+| MidSenescence | Continued NDVI decline | 0.2–0.4 |
+| Dormancy | Post-harvest / bare soil | <0.2 |
+
+**Important:** Rice phenology is only scored when the crop prediction is also correct. Improving crop F1 — especially rice recall — directly improves the phenology component of AlgoScore.
+
+---
+
+## 8. Performance Tips
+
+- **Low rice recall:** Check LSWI−EVI flooding fraction. Rice transplanting window (LSWI−EVI > 0) is the most discriminative rice feature. If in-bounds observations are sparse during June–July, the model may miss rice.
+- **Low pheno F1:** Verify the LSTM is using `lstm_best.pt` not `lstm_final.pt`. The best checkpoint (by val loss) usually generalizes better.
+- **Improving corn/soy separation:** NDRE and CIre red-edge bands are the primary separators. Check that B05, B07, B8A bands are loading correctly.
+- **Score plateau after epoch 20:** Try reducing `--lr` to `5e-4` or increasing `--hidden_dim` to 256 for more model capacity.
+- **Sparse observations:** Points near cloud-heavy regions may have few valid timesteps. The DOY-encoded sequence approach handles this, but very sparse points (<3 valid dates) will degrade accuracy.
+
+---
+
+## 9. Troubleshooting
+
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| `ModuleNotFoundError` | Missing package | `pip install -r requirements.txt` |
+| `0 in-bounds` points | Wrong `--tiff_dir` path | Verify path exists and contains `.tiff` files |
+| All predictions = `background` | No trained models found | Run training first, then inference |
+| `result.json` missing keys | NaN in Longitude/Latitude | Inspect input CSV for malformed rows |
+| Score = 0 on platform | Wrong output path or filename | Must be `/output/result.json` exactly |
+| Low pheno F1 | Crop misclassified (not rice) | Phenology only scored when crop = rice; fix crop F1 first |
+| CUDA out of memory | Batch too large | Reduce `--batch_size` to 32 or 16 |
+| `result.json` date keys wrong | Date reformatted by pandas | Keys must match input CSV exactly — code preserves raw string |
+| Training stalls at same loss | Learning rate too high | Try `--lr 5e-4` or add warmup |
+| Platform CI fails | Models not committed | `git add models/` before push |
+
+---
+
+## 10. Platform Notes
+
+- Each `git push origin main` counts as one submission. Limit is **3 per day**.
+- The platform runs inference only — no training occurs in the container.
+- Container has no internet access. All dependencies must be in the Docker image.
+- Output file must be at `/output/result.json` — any other path or name scores zero.
+- To create a GitLab access token for pushing: **Avatar → Edit Profile → Access Tokens**.
